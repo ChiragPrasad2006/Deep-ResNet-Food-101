@@ -160,6 +160,8 @@ class ResNet(nn.Module):
         x = self.fc(x)
         return x
 
+device="cuda" if torch.cuda.is_available() else "cpu"
+
 #Transform dataset/define Transformer size and convert to tensor
 transform=torchvision.transforms.Compose([torchvision.transforms.Resize((224,224)),
     torchvision.transforms.ToTensor()])
@@ -175,19 +177,21 @@ train_data,test_data=torch.utils.data.random_split(full_dataset,[train_size,test
 print(len(train_data))
 print(len(test_data))
 
-train_dataloader=torch.utils.data.DataLoader(dataset=train_data,batch_size=64,shuffle=True)
-test_dataloader=torch.utils.data.DataLoader(dataset=test_data,batch_size=64,shuffle=False)
+train_dataloader=torch.utils.data.DataLoader(dataset=train_data,batch_size=64,shuffle=True).to(device)
+test_dataloader=torch.utils.data.DataLoader(dataset=test_data,batch_size=64,shuffle=False).to(device)
 
 #model
-ResNet_Food_101=ResNet(Bottleneck,[3,4,23,3],num_classes=101)
+ResNet_Food_101=ResNet(Bottleneck,[3,4,23,3],num_classes=101).to(device)
 torch.manual_seed(0)
 
 #optimizer
-optimizer=torch.optim.AdamW(params=ResNet_Food_101.parameters(),lr=1e-4,weight_decay=1e-6)
+optimizer=torch.optim.AdamW(params=ResNet_Food_101.parameters(),lr=1e-4,weight_decay=1e-6).to(device)
 #loss function
-loss_fn=nn.CrossEntropyLoss()
+loss_fn=nn.CrossEntropyLoss().to(device)
 #accuracy_fn
-acc_fn=torchmetrics.Accuracy(task="multiclass",num_classes=101)
+acc_fn=torchmetrics.Accuracy(task="multiclass",num_classes=101).to(device)
+
+scaler=torch.amp.GradScaler()
 
 #train and test loop
 def train_step(model:torch.nn.Module,dataloader:torch.utils.data.DataLoader,loss_fn:torch.nn.Module,optimizer:torch.optim.Optimizer,acc_fn:torchmetrics.Accuracy):
@@ -195,11 +199,14 @@ def train_step(model:torch.nn.Module,dataloader:torch.utils.data.DataLoader,loss
     train_loss=0
     train_acc=0
     for batch,(X,y) in enumerate(dataloader):
-        y_pred_logits=model(X)
-        loss=loss_fn(y_pred_logits,y)
+        X,y=X.to(device),y.to(device)
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast(device_type="cuda",dtype=torch.bfloat16):
+            y_pred_logits=model(X)
+            loss=loss_fn(y_pred_logits,y)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         y_pred_labels=torch.argmax(y_pred_logits,dim=1)
         train_loss+=loss.item()
         train_acc+=acc_fn(y_pred_labels,y)
