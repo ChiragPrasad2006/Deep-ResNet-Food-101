@@ -5,11 +5,14 @@ url: https://huggingface.co/Kami0867/resnet-101-food101/commit/c017074ad3b50bec9
 
 # Loading Model
 
-**model_id = "Kami0867/resnet-101-food101"**
+```python
+from transformers import AutoImageProcessor, AutoModelForImageClassification
 
-**tokenizer = AutoTokenizer.from_pretrained(model_id)**
+model_id = "Kami0867/resnet-101-food101"
 
-**model = AutoModelForSequenceClassification.from_pretrained(model_id)**
+image_processor = AutoImageProcessor.from_pretrained(model_id)
+model = AutoModelForImageClassification.from_pretrained(model_id)
+```
 
 # Dataset 
 
