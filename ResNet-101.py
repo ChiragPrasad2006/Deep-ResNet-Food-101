@@ -164,6 +164,66 @@ class ResNet(nn.Module):
 device = "cuda" if torch.cuda.is_available() else "cpu"
 bf16 = device == "cuda" and torch.cuda.is_bf16_supported()
 
+
+def set_backbone_trainable(model, trainable):
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad = trainable or name.startswith("classifier.")
+
+
+def split_food101_indices(full_dataset, data_dir, meta_dir):
+    sample_lookup = {}
+    for index, (sample_path, _) in enumerate(full_dataset.samples):
+        relative_path = Path(sample_path).resolve().relative_to(
+            data_dir.resolve()
+        )
+        sample_key = relative_path.with_suffix("").as_posix()
+        sample_lookup[sample_key] = index
+
+    def read_metadata_split(filename):
+        metadata_path = meta_dir / filename
+        if not metadata_path.is_file():
+            return None
+        keys = [
+            line.strip()
+            for line in metadata_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        missing = [key for key in keys if key not in sample_lookup]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} entries from {metadata_path} were not found "
+                f"under {data_dir}"
+            )
+        return [sample_lookup[key] for key in keys]
+
+    official_train = read_metadata_split("train.txt")
+    official_test = read_metadata_split("test.txt")
+    if official_train is None or official_test is None:
+        raise FileNotFoundError(
+            f"Food-101 metadata was not found in {meta_dir}. "
+            "Expected train.txt and test.txt."
+        )
+
+    # Keep the official test split untouched and reserve 10% of official
+    # training images for validation, stratified by class.
+    generator = torch.Generator().manual_seed(0)
+    train_indices = []
+    val_indices = []
+    for class_id in range(len(full_dataset.classes)):
+        class_indices = [
+            index for index in official_train
+            if full_dataset.targets[index] == class_id
+        ]
+        permutation = torch.randperm(
+            len(class_indices), generator=generator
+        ).tolist()
+        shuffled = [class_indices[index] for index in permutation]
+        val_count = max(1, int(0.1 * len(shuffled)))
+        val_indices.extend(shuffled[:val_count])
+        train_indices.extend(shuffled[val_count:])
+
+    return train_indices, val_indices, official_test
+
 # train and test loop functions
 def train_step(model: torch.nn.Module, dataloader: torch.utils.data.DataLoader, loss_fn: torch.nn.Module, optimizer: torch.optim.Optimizer):
     model.train()
@@ -248,6 +308,7 @@ if __name__ == '__main__':
     # Use the container path when available, with the repository-local path as
     # a fallback for running this script from the project directory.
     DATA_DIR = Path("/data/images") if Path("/data/images").is_dir() else Path("data/images")
+    META_DIR = DATA_DIR.parent / "meta" / "meta"
     EXPECTED_NUM_CLASSES = 101
     EXPECTED_IMAGES_PER_CLASS = 1000
     BATCH_SIZE = 64
@@ -288,13 +349,11 @@ if __name__ == '__main__':
     print(f"Classes: {CLASS_TO_ID}")
     print(f"bf16 enabled: {bf16} (device: {device})")
 
-    # Split indices deterministically, while allowing different transforms per split.
-    train_size = int(0.9 * len(full_dataset))
-    test_size = int(len(full_dataset) - train_size)
-    split_generator = torch.Generator().manual_seed(0)
-    indices = torch.randperm(len(full_dataset), generator=split_generator).tolist()
-    train_indices = indices[:train_size]
-    test_indices = indices[train_size:train_size + test_size]
+    train_indices, val_indices, test_indices = split_food101_indices(
+        full_dataset,
+        DATA_DIR,
+        META_DIR
+    )
 
     train_data = torch.utils.data.Subset(
         torchvision.datasets.ImageFolder(
@@ -302,6 +361,13 @@ if __name__ == '__main__':
             transform=train_transform
         ),
         train_indices
+    )
+    val_data = torch.utils.data.Subset(
+        torchvision.datasets.ImageFolder(
+            root=DATA_DIR,
+            transform=test_transform
+        ),
+        val_indices
     )
     test_data = torch.utils.data.Subset(
         torchvision.datasets.ImageFolder(
@@ -311,6 +377,7 @@ if __name__ == '__main__':
         test_indices
     )
     print(f"Train samples: {len(train_data)}")
+    print(f"Validation samples: {len(val_data)}")
     print(f"Test samples: {len(test_data)}")
 
     # DataLoaders with multi-process pre-fetching
@@ -322,12 +389,21 @@ if __name__ == '__main__':
         pin_memory=device == "cuda",
         persistent_workers=True
     )
+    val_dataloader = torch.utils.data.DataLoader(
+        dataset=val_data,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=device == "cuda",
+        persistent_workers=True
+    )
     test_dataloader = torch.utils.data.DataLoader(
         dataset=test_data,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=0,
-        pin_memory=device == "cuda"
+        num_workers=4,
+        pin_memory=device == "cuda",
+        persistent_workers=True
     )
 
     # Model
@@ -343,38 +419,65 @@ if __name__ == '__main__':
     ResNet_Food_101.config.id2label = ID_TO_CLASS
     ResNet_Food_101.config.label2id = CLASS_TO_ID
     ResNet_Food_101 = ResNet_Food_101.to(device)
+    set_backbone_trainable(ResNet_Food_101, trainable=False)
 
     # Optimizer
+    classifier_parameters = list(ResNet_Food_101.classifier.parameters())
+    backbone_parameters = [
+        parameter for name, parameter in ResNet_Food_101.named_parameters()
+        if not name.startswith("classifier.")
+    ]
     optimizer = torch.optim.AdamW(
-        params=ResNet_Food_101.parameters(),
-        lr=1e-4,
+        params=[
+            {"params": classifier_parameters, "lr": 1e-3},
+            {"params": backbone_parameters, "lr": 1e-4}
+        ],
         weight_decay=1e-4
     )
     # Loss function
     loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1).to(device)
     num_epochs = 15
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    frozen_epochs = 2
+    warmup_epochs = 2
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        T_max=num_epochs
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=warmup_epochs
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs - warmup_epochs
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs]
     )
     checkpoint_interval = 5
     MODEL_PATH = Path("models")
     MODEL_PATH.mkdir(parents=True, exist_ok=True)
+    best_val_acc = -1.0
+    best_epoch = 0
 
     # Training and testing loop
     for epoch in tqdm(range(num_epochs)):
+        if epoch == frozen_epochs:
+            set_backbone_trainable(ResNet_Food_101, trainable=True)
+            print("Backbone unfrozen; fine-tuning the complete model.")
+
         train_loss, train_acc = train_step(
             model=ResNet_Food_101,
             dataloader=train_dataloader,
             loss_fn=loss_fn,
             optimizer=optimizer
         )
-        test_loss, test_acc = test_step(
+        val_loss, val_acc = test_step(
             model=ResNet_Food_101,
-            dataloader=test_dataloader,
+            dataloader=val_dataloader,
             loss_fn=loss_fn
         )
-        print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
+        print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}%")
         scheduler.step()
 
         checkpoint = {
@@ -384,17 +487,35 @@ if __name__ == '__main__':
             "scheduler_state_dict": scheduler.state_dict(),
             "train_loss": train_loss,
             "train_acc": train_acc,
-            "test_loss": test_loss,
-            "test_acc": test_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "best_val_acc": best_val_acc,
         }
 
         # Keep the newest completed epoch available for resuming.
         torch.save(checkpoint, MODEL_PATH / "ResNet_Food_101_latest_checkpoint.pth")
 
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_epoch = epoch + 1
+            checkpoint["best_val_acc"] = best_val_acc
+            torch.save(checkpoint, MODEL_PATH / "ResNet_Food_101_best_checkpoint.pth")
+            print(f"Best validation checkpoint saved at epoch {best_epoch}.")
+
         if (epoch + 1) % checkpoint_interval == 0:
             checkpoint_path = MODEL_PATH / f"ResNet_Food_101_epoch_{epoch + 1:03d}.pth"
             torch.save(checkpoint, checkpoint_path)
             print(f"Checkpoint saved to: {checkpoint_path}")
+
+    best_checkpoint_path = MODEL_PATH / "ResNet_Food_101_best_checkpoint.pth"
+    best_checkpoint = torch.load(best_checkpoint_path, map_location=device)
+    ResNet_Food_101.load_state_dict(best_checkpoint["model_state_dict"])
+    test_loss, test_acc = test_step(
+        model=ResNet_Food_101,
+        dataloader=test_dataloader,
+        loss_fn=loss_fn
+    )
+    print(f"Best epoch: {best_checkpoint['epoch']} | Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
 
     MODEL_NAME = "ResNet_Food_101_v1.pth"
     MODEL_SAVE_PATH = MODEL_PATH / MODEL_NAME
